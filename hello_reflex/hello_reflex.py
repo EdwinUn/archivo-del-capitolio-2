@@ -1,406 +1,403 @@
 # hello_reflex.py
-# Sistema de Gestión Documental Inteligente SIN Chakra (compatible con Reflex core)
+# (Código completo y corregido, listo para usar)
 
-from __future__ import annotations
-import os, re, string
+from _future_ import annotations
+
+import os
+import re
+import io
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, List, Dict, Any
+from typing import List, Any 
 
 import reflex as rx
 from sqlmodel import Field, select
-from PyPDF2 import PdfReader
-import pdfplumber
 
-# --------- Rutas ---------
-DOCS_DIR = Path("assets/docs")
+# ---------------- Rutas de trabajo ----------------
+ASSETS_DIR = Path("assets")
+DOCS_DIR = ASSETS_DIR / "docs"
 DOCS_DIR.mkdir(parents=True, exist_ok=True)
 
-# --------- Modelo ---------
+
+# ---------------- Modelo persistente ----------------
 class Document(rx.Model, table=True):
     id: int | None = Field(default=None, primary_key=True)
     filename: str
-    filepath: str
-    text_snippet: str = ""
-    tags_str: str = ""
+    relpath: str                         
+    text_snippet: str = ""               
+    tags_str: str = ""                   
     uploaded_at: datetime = Field(default_factory=datetime.utcnow)
 
     @staticmethod
-    def normalize_tags(tags: List[str]) -> str:
+    def tags_to_str(tags: list[str]) -> str:
         clean = sorted({t.strip().lower() for t in tags if t and t.strip()})
         return ",".join(clean)
 
-    @property
-    def tags(self) -> List[str]:
-        if not self.tags_str:
+    @staticmethod
+    def str_to_tags(tags_str: str) -> list[str]:
+        if not tags_str:
             return []
-        return [t.strip() for t in self.tags_str.split(",") if t.strip()]
+        return [t for t in (x.strip() for x in tags_str.split(",")) if t]
 
-# --------- Utilidades PDF y Modelo de IA (TF-IDF/Frecuencia) ---------
-STOPWORDS = {
-    "el","la","los","las","un","una","unos","unas","de","del","al","a","y","o","u","que","en","se","para","por",
-    "con","sin","como","es","son","ser","fue","era","han","ha","hay","más","menos","ya","no","sí","lo","le","les",
-    "esto","esta","este","estas","estos","eso","esa","ese","esos","esas","muy","también","entre","sobre","hasta",
-    "desde","cuando","qué","cuál","cual","donde","porque","ante","bajo","cabe","contra","hacia","según","mediante",
-    "documento","pdf","archivo","archivos","capitolio"
-}
 
-def _clean(s: str) -> str:
-    s = s.replace("\x00", " ")
-    s = re.sub(r"\s+", " ", s)
-    return s.strip()
+# ---------------- Utilidades ----------------
+def _safe_filename(name: str) -> str:
+    base = os.path.basename(name)
+    base = re.sub(r"[^\w\-. ]+", "_", base, flags=re.I)
+    return base or f"file_{int(datetime.utcnow().timestamp())}.pdf"
 
-def extract_text_from_pdf(path: Path) -> str:
+
+def extract_text_from_pdf(pdf_bytes: bytes) -> str:
+    """Intenta extraer texto con PyPDF2; si queda vacío, usa OCR si está disponible."""
     text = ""
     try:
-        reader = PdfReader(str(path))
+        from PyPDF2 import PdfReader
+        reader = PdfReader(io.BytesIO(pdf_bytes))
         parts = []
-        for p in reader.pages:
+        for page in reader.pages:
             try:
-                parts.append(p.extract_text() or "")
+                parts.append(page.extract_text() or "")
             except Exception:
                 parts.append("")
-        text = _clean(" ".join(parts))
+        text = "\n".join(parts).strip()
     except Exception:
         text = ""
 
-    if not text or len(text) < 40:
+    if not text:
         try:
-            with pdfplumber.open(str(path)) as pdf:
-                parts = []
-                for pg in pdf.pages:
-                    try:
-                        parts.append(pg.extract_text() or "")
-                    except Exception:
-                        parts.append("")
-            alt = _clean(" ".join(parts))
-            if len(alt) > len(text):
-                text = alt
+            from pdf2image import convert_from_bytes
+            import pytesseract
+            images = convert_from_bytes(pdf_bytes, dpi=200)
+            ocr_parts = []
+            for img in images:
+                try:
+                    ocr_parts.append(pytesseract.image_to_string(img) or "")
+                except Exception:
+                    ocr_parts.append("")
+            text = "\n".join(ocr_parts).strip()
         except Exception:
             pass
 
-    if (not text or len(text) < 40) and os.getenv("ENABLE_OCR", "0") in {"1", "true", "TRUE"}:
-        try:
-            import pytesseract
-            from pdf2image import convert_from_path
-            imgs = convert_from_path(str(path))
-            ocr_txts = [pytesseract.image_to_string(im, lang="spa+eng") for im in imgs]
-            text_ocr = _clean(" ".join(ocr_txts))
-            if len(text_ocr) > len(text):
-                text = text_ocr
-        except Exception:
-            pass
     return text
 
-def suggest_tags_from_text(text: str, k: int = 6) -> List[str]:
-    if not text:
-        return []
-    t = text.lower()
-    t = t.translate(str.maketrans({c: " " for c in string.punctuation + "¿¡“”¨´`‘’"}))
-    tokens = [w for w in t.split() if len(w) > 2 and w not in STOPWORDS and not w.isdigit()]
-    if not tokens:
-        return []
-    try:
-        from sklearn.feature_extraction.text import TfidfVectorizer
-        vec = TfidfVectorizer(stop_words=list(STOPWORDS), max_features=800)
-        X = vec.fit_transform([" ".join(tokens)])
-        feats = vec.get_feature_names_out()
-        scores = X.toarray()[0]
-        order = scores.argsort()[::-1]
-        raw = [feats[i] for i in order[:k*2]]
-    except Exception:
-        from collections import Counter
-        raw = [w for w, _ in Counter(tokens).most_common(k*2)]
-    out: List[str] = []
-    for w in raw:
-        w = w.strip().lower()
-        if w and w not in out and re.search(r"[a-záéíóúñ]", w):
-            out.append(w)
-        if len(out) >= k:
-            break
-    return out
 
-# --------- Estado ---------
-class AppState(rx.State):
-    query: str = ""
-    tag_filter: str = ""
-    edit_id: Optional[int] = None
-    edit_tags_input: str = ""
+# ---------------- Sugerencia de etiquetas ----------------
+PRESET_TAGS = {
+    "factura": ["subtotal", "iva", "rfc", "factura", "total", "folio", "cfdi", "emisor", "receptor"],
+    "contrato": ["contrato", "cláusula", "acuerdo", "firmante", "vigencia", "obligaciones", "rescindir"],
+    "impuestos": ["impuesto", "sat", "declaración", "retenciones", "isr", "iva", "anual"],
+    "personal": ["currículum", "cv", "empleo", "reclutamiento", "postulante", "nombramiento"],
+    "legal": ["demanda", "notificación", "juzgado", "representante legal", "poder", "amparo"],
+    "proveedores": ["proveedor", "cotización", "orden de compra", "oc", "suministro"],
+    "finanzas": ["balance", "ingresos", "egresos", "presupuesto", "flujo de efectivo"],
+    "educación": ["constancia", "certificado", "calificaciones", "kárdex", "boleta"],
+    "salud": ["receta", "diagnóstico", "consulta", "medicamento"],
+}
 
-    def set_query(self, v: str): self.query = v
-    def set_tag_filter(self, v: str): self.tag_filter = v
-    def set_edit_tags_input(self, v: str): self.edit_tags_input = v
+def suggest_tags(text: str, top_k: int = 5) -> list[str]:
+    text_low = text.lower()
+    scores: dict[str, int] = {}
+    for tag, kws in PRESET_TAGS.items():
+        s = sum(text_low.count(k.lower()) for k in kws)
+        if s > 0:
+            scores[tag] = s
+    for kw in ["2023", "2024", "2025", "confidencial", "urgente"]:
+        c = text_low.count(kw)
+        if c > 0:
+            scores[kw] = scores.get(kw, 0) + c
+    ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+    return [t for t, _ in ranked[:top_k]]
 
-    # NOTA: Los `rx.var` de `docs` y `all_tags` se re-evalúan en el backend 
-    # cuando una acción (como `handle_upload`) ha terminado.
 
-    @rx.var
-    def docs(self) -> List[dict]:
-        with rx.session() as s:
-            rows = s.exec(select(Document).order_by(Document.uploaded_at.desc())).all()
-        out: List[dict] = []
-        for d in rows:
-            out.append({
-                "id": d.id,
-                "filename": d.filename,
-                "url": d.filepath,
-                "tags": d.tags,
-                "uploaded_at": d.uploaded_at.strftime("%Y-%m-%d %H:%M"),
-                "snippet": (d.text_snippet[:280] + "…") if len(d.text_snippet) > 280 else d.text_snippet,
-            })
-        return out
+# ---------------- Estado ----------------
+class State(rx.State):
+    # Campos y valores
+    manual_tags: str = ""
+    search_text: str = ""
+    search_tag: str = ""
+    info: str = ""
+    loading: bool = False
 
-    @rx.var
-    def filtered_docs(self) -> List[dict]:
-        q = (self.query or "").strip().lower()
-        tf = (self.tag_filter or "").strip().lower()
-        data = list(self.docs)
-        if tf:
-            data = [d for d in data if any(tf in t.lower() for t in d["tags"])]
-        if q:
-            data = [
-                d for d in data
-                if q in d["filename"].lower()
-                or q in d["snippet"].lower()
-                or any(q in t for t in d["tags"])
-            ]
-        return data
+    last_suggested: list[str] = []
 
-    @rx.var
-    def all_tags(self) -> List[str]:
-        tags = set()
-        for d in self.docs:
-            for t in d["tags"]:
-                tags.add(t)
-        
-        # Etiquetas predeterminadas si la lista dinámica está vacía
-        dynamic_tags = sorted(tags)
-        if not dynamic_tags:
-            return ["contrato", "factura", "informe", "legal", "personal", "manual", "2025"]
+    # Lista serializable (tipado explícito)
+    visible_docs: list[dict[str, Any]] = [] 
 
-        return dynamic_tags
+    # ---- setters explícitos (evitan deprecation) ----
+    def set_manual_tags(self, v: str):
+        self.manual_tags = v
 
-    async def handle_upload(self, files: List[rx.UploadFile]):
-        if not files:
-            return
-        
-        # Esta línea es clave para evitar la re-renderización excesiva durante la subida
-        # y para asegurar que el listado de documentos se actualice al final.
-        upload_actions = []
+    def set_search_text(self, v: str):
+        self.search_text = v
 
-        for up in files:
-            original = Path(up.filename).name
-            unique = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f") + "_" + original
-            dst = DOCS_DIR / unique
-            
-            data = await up.read()
-            dst.write_bytes(data)
+    def set_search_tag(self, v: str):
+        self.search_tag = v
 
-            text = extract_text_from_pdf(dst)
-            snippet = (text or "")[:800]
-            suggested = suggest_tags_from_text(text, k=6)
+    # ---- ciclo de vida ----
+    def on_load(self):
+        return self.refresh_list()
 
-            with rx.session() as s:
-                row = Document(
-                    filename=original,
-                    filepath=f"/docs/{unique}", 
-                    text_snippet=snippet,
-                    tags_str=Document.normalize_tags(suggested),
+    def set_info(self, msg: str):
+        self.info = msg
+
+    # ---- consultas DB -> visible_docs ----
+    def refresh_list(self):
+        """Carga y filtra documentos; convierte a dicts serializables para foreach."""
+        with rx.session() as sess:
+            docs = list(sess.exec(select(Document).order_by(Document.uploaded_at.desc())).all())
+
+        st = self.search_text.strip().lower()
+        tg = self.search_tag.strip().lower()
+
+        result: list[dict[str, Any]] = []
+        for d in docs:
+            ok = True
+            if st:
+                ok = (st in d.filename.lower()) or (st in (d.text_snippet or "").lower())
+            if ok and tg:
+                ok = tg in set(Document.str_to_tags(d.tags_str))
+            if ok:
+                result.append(
+                    {
+                        "id": d.id,
+                        "filename": d.filename,
+                        "url": f"/assets/{d.relpath}",
+                        "date": d.uploaded_at.strftime("%Y-%m-%d %H:%M"),
+                        "snippet": d.text_snippet or "",
+                        "tags": Document.str_to_tags(d.tags_str),
+                    }
                 )
-                s.add(row)
-                s.commit()
-                # No se requiere un `upload_actions.append` explícito para la base de datos,
-                # ya que se guardó sincrónicamente y los rx.vars se re-evaluarán.
 
-        # MODIFICACIÓN CLAVE: Limpiar la cola de subida y luego devolver una acción 
-        # para forzar la re-evaluación del estado.
-        return [
-            rx.upload_files.clear(),
-            AppState.set_query(AppState.query), # Acción que fuerza la re-evaluación de rx.vars
-        ]
+        self.visible_docs = result
 
-
-    def start_edit_id(self, doc_id: int):
-        """Busca en DB y abre el editor con las etiquetas actuales."""
-        with rx.session() as s:
-            row = s.get(Document, doc_id)
-            if row:
-                self.edit_id = doc_id
-                self.edit_tags_input = ", ".join(row.tags)
-
-    def cancel_edit(self):
-        self.edit_id = None
-        self.edit_tags_input = ""
-
-    def save_tags(self):
-        if self.edit_id is None:
+    # ---- subida ----
+    async def handle_upload(self, files: list[rx.UploadFile]):
+        if not files:
+            self.info = "No se adjuntó ningún archivo."
             return
-        csv = Document.normalize_tags([t for t in self.edit_tags_input.split(",")])
-        with rx.session() as s:
-            row = s.get(Document, self.edit_id)
-            if row:
-                row.tags_str = csv
-                s.add(row)
-                s.commit()
-        self.cancel_edit()
 
+        self.loading = True
+        self.info = "Procesando documentos…"
+        created = 0
+
+        for uf in files:
+            if not uf.filename.lower().endswith(".pdf"):
+                continue
+            data = await uf.read()
+            filename = _safe_filename(uf.filename)
+            dest = DOCS_DIR / filename
+            try:
+                with open(dest, "wb") as f:
+                    f.write(data)
+            except Exception as e:
+                self.info = f"Error guardando {filename}: {e}"
+                continue
+
+            text = extract_text_from_pdf(data) or ""
+            snippet = (text[:300] + "…") if len(text) > 300 else text
+
+            auto = suggest_tags(text)
+            self.last_suggested = auto
+
+            manual = [t.strip() for t in self.manual_tags.split(",")] if self.manual_tags else []
+            all_tags = Document.tags_to_str(manual + auto)
+
+            with rx.session() as sess:
+                doc = Document(
+                    filename=filename,
+                    relpath=str(Path("docs") / filename).replace("\\", "/"),
+                    text_snippet=snippet or "",
+                    tags_str=all_tags,
+                )
+                sess.add(doc)
+                sess.commit()
+                created += 1
+
+        self.loading = False
+        self.info = f"Se indexaron {created} documento(s)."
+        self.manual_tags = ""
+        return self.refresh_list()
+
+    # ---- acciones ----
     def delete_doc(self, doc_id: int):
-        with rx.session() as s:
-            row = s.get(Document, doc_id)
-            if row:
-                try:
-                    fs = Path("assets") / Path(row.filepath.lstrip("/"))
-                    if fs.exists():
-                        fs.unlink(missing_ok=True)
-                except Exception:
-                    pass
-                s.delete(row)
-                s.commit()
-        self.query = self.query
+        with rx.session() as sess:
+            d = sess.get(Document, doc_id)
+            if d is None:
+                self.info = "Documento no encontrado."
+                return
+            try:
+                p = ASSETS_DIR / Path(d.relpath)
+                if p.exists():
+                    p.unlink()
+            except Exception:
+                pass
+            sess.delete(d)
+            sess.commit()
+        self.info = "Documento eliminado."
+        return self.refresh_list()
 
-# --------- UI (solo core) ---------
-def tag_pill(t: rx.Var[str] | str) -> rx.Component:
-    return rx.box(
-        t, padding="4px 8px", border_radius="12px", border="1px solid #ddd",
-        margin_right="6px", margin_bottom="6px", display="inline-block", font_size="12px",
-    )
+    def clear_filters(self):
+        self.search_text = ""
+        self.search_tag = ""
+        return self.refresh_list()
 
-def doc_row(d: rx.Var[dict]) -> rx.Component:
-    doc_tags: rx.Var[List[str]] = d["tags"].to(List[str]) 
+
+# ---------------- Componentes UI ----------------
+def tag_badge(tag: str) -> rx.Component:
+    return rx.badge(tag, color_scheme="gray", variant="soft", class_name="rounded-full")
+
+
+def doc_card_from_dict(d: rx.Var[dict[str, Any]]) -> rx.Component:
     
-    tags_box = rx.box(
-        rx.foreach(doc_tags, lambda t: tag_pill(t)),
-        margin_top="8px",
-    )
-
-    editor = rx.cond(
-        AppState.edit_id == d["id"],
-        rx.box(
-            rx.input(
-                value=AppState.edit_tags_input,
-                on_change=AppState.set_edit_tags_input,
-                placeholder="contrato, factura, 2025",
-                width="100%",
-            ),
+    # CORRECCIÓN: Forzar el tipo de la lista anidada "tags"
+    tags_list: rx.Var[List[str]] = d["tags"].to(List[str]) 
+    
+    return rx.card(
+        rx.vstack(
             rx.hstack(
-                rx.button("Guardar", on_click=AppState.save_tags),
-                rx.button("Cancelar", on_click=AppState.cancel_edit),
-                spacing="2",
-                margin_top="6px",
-            ),
-            margin_top="8px",
-        ),
-        rx.box()
-    )
-
-    return rx.box(
-        rx.hstack(
-            rx.vstack(
                 rx.text(d["filename"], weight="bold"),
-                rx.text(d["uploaded_at"], size="2", color="#666"),
-                align_items="start",
-                spacing="1",
-            ),
-            rx.spacer(),
-            rx.link("Abrir / Descargar", href=d["url"], is_external=True),
-            spacing="3",
-            align_items="center",
-        ),
-        rx.text(d["snippet"], margin_top="6px"),
-        tags_box,
-        rx.hstack(
-            rx.button("Editar etiquetas", on_click=lambda: AppState.start_edit_id(d["id"])),
-            rx.button("Eliminar", on_click=lambda: AppState.delete_doc(d["id"]), color_scheme="red"),
-            spacing="2",
-            margin_top="8px",
-        ),
-        editor,
-        padding="12px",
-        border="1px solid #e5e5e5",
-        border_radius="12px",
-        _hover={"box_shadow": "0 2px 8px rgba(0,0,0,.06)"},
-    )
-
-def upload_zone() -> rx.Component:
-    return rx.box(
-        rx.text("Sube PDFs; sugeriremos etiquetas automáticamente.", size="2"),
-        rx.upload(
-            rx.button("Seleccionar PDF(s)"),
-            accept={".pdf"}, multiple=True, max_files=10,
-            border="2px dashed #cfcfcf", padding="18px", width="100%", margin_top="8px",
-        ),
-        rx.cond(
-            rx.upload_files,
-            rx.box(
-                rx.text("Archivos listos para cargar:"),
-                rx.foreach(rx.upload_files, lambda name: rx.text(name)),
-                margin_top="10px",
-                padding="8px",
-                border="1px solid #ccc",
-                border_radius="8px",
-            ),
-        ),
-        rx.hstack(
-            rx.button("Cargar a la biblioteca", on_click=lambda: AppState.handle_upload(rx.upload_files())),
-            rx.text("Solo PDF • OCR opcional"),
-            spacing="3",
-            margin_top="8px",
-        ),
-        padding="12px", border="1px solid #eee", border_radius="12px", background_color="#fafafa",
-    )
-
-def search_bar() -> rx.Component:
-    return rx.vstack(
-        rx.hstack(
-            rx.input(
-                value=AppState.query,
-                on_change=AppState.set_query,
-                placeholder="Buscar por nombre, contenido o etiqueta…",
+                rx.spacer(),
+                rx.text(d["date"], size="2", color_scheme="gray"),
+                align="center",
                 width="100%",
             ),
-            spacing="3",
+            rx.text(d["snippet"], size="2", color_scheme="gray"),
+            rx.hstack(rx.foreach(tags_list, lambda t: tag_badge(t)), wrap="wrap", gap="2"),
+            rx.hstack(
+                rx.link(rx.button("Abrir"), href=d["url"], is_external=True),
+                rx.button("Eliminar", color_scheme="red", variant="soft", on_click=State.delete_doc(d["id"])),
+                align="start",
+                gap="3",
+            ),
+            align="start",
+            gap="3",
             width="100%",
         ),
-        rx.hstack(
-            rx.text("Filtrar por etiqueta:"),
-            rx.select(
-                # El componente select debe ser compatible con la versión de Reflex
-                items=AppState.all_tags, 
-                value=AppState.tag_filter, 
-                on_change=AppState.set_tag_filter, 
-                placeholder="Selecciona una etiqueta...",
-                width="260px",
-            ),
-            spacing="2",
-            align_items="center",
-        ),
-        spacing="3",
-        align_items="stretch", width="100%",
+        class_name="w-full",
+        size="3",
+        variant="surface",
     )
 
-def page() -> rx.Component:
-    return rx.container(
+
+def sidebar_upload() -> rx.Component:
+    return rx.card(
         rx.vstack(
-            rx.heading("El Archivo del Capitolio", size="6"),
-            rx.text("Sistema de Gestión Documental Inteligente", color="#666"),
-            upload_zone(),
-            search_bar(),
-            rx.separator(margin="6px 0"),
-            rx.cond(
-                AppState.filtered_docs,
-                rx.vstack(
-                    rx.foreach(AppState.filtered_docs, lambda d: doc_row(d)),
-                    spacing="3",
-                    align_items="stretch",
-                ),
-                rx.text("Sin documentos aún. Sube algunos PDFs para empezar.", color="#666"),
+            rx.heading("Cargar PDF", size="5"),
+            rx.text("Arrastra o selecciona archivos (.pdf).", size="2", color_scheme="gray"),
+            
+            rx.upload(
+                rx.vstack(rx.icon("upload"), rx.text("Suelta PDFs aquí o haz clic", size="2")),
+                accept={"application/pdf": [".pdf"]},
+                max_files=10,
+                disabled=State.loading,
+                on_drop=State.handle_upload,
+                width="100%",
+                class_name="border-2 border-dashed rounded-2xl p-6",
             ),
-            spacing="4",
-            align_items="stretch", padding_y="20px",
+            
+            rx.cond(
+                State.loading,
+                rx.hstack(
+                    rx.spinner(size="2"), # CORREGIDO: Usamos '2' para el tamaño.
+                    rx.text("Procesando documentos...", color_scheme="blue", size="3"),
+                    gap="3",
+                    align="center",
+                ),
+                rx.text(State.info, color_scheme="gray"),
+            ),
+            
+            rx.divider(),
+            rx.text("Etiquetas manuales (separadas por comas)", size="2"),
+            rx.input(
+                placeholder="ej. contrato, 2025, confidencial",
+                value=State.manual_tags,
+                on_change=State.set_manual_tags,
+                width="100%",
+            ),
+            rx.divider(),
+            rx.heading("Sugerencias (último PDF)", size="4"),
+            rx.hstack(rx.foreach(State.last_suggested, lambda t: tag_badge(t)), wrap="wrap", gap="2", width="100%"),
+            
+            align="start",
+            gap="3",
+            width="100%",
         ),
-        max_width="1100px", padding_y="20px",
+        size="3",
+        variant="surface",
+        class_name="w-full",
     )
 
-# --------- App ---------
+
+def search_bar() -> rx.Component:
+    return rx.card(
+        rx.vstack(
+            rx.heading("Buscar y filtrar", size="5"),
+            rx.hstack(
+                rx.input(
+                    placeholder="Buscar por nombre o contenido…",
+                    value=State.search_text,
+                    on_change=State.set_search_text,
+                    width="100%",
+                ),
+                rx.input(
+                    placeholder="Filtrar por etiqueta (ej. factura)…",
+                    value=State.search_tag,
+                    on_change=State.set_search_tag,
+                    width="50%",
+                ),
+                rx.button("Aplicar", on_click=State.refresh_list),
+                rx.button("Limpiar", variant="soft", on_click=State.clear_filters),
+                width="100%",
+                align="center",
+                spacing="3",
+            ),
+            align="start",
+            gap="3",
+            width="100%",
+        ),
+        size="3",
+        variant="surface",
+        class_name="w-full",
+    )
+
+
+def docs_grid() -> rx.Component:
+    # CORRECCIÓN: 'columns' en rx.grid debe ser un string.
+    return rx.grid(
+        rx.foreach(State.visible_docs, lambda d: doc_card_from_dict(d)),
+        columns="1 2 3",
+        gap="4",
+        width="100%",
+    )
+
+
+def header_bar() -> rx.Component:
+    return rx.hstack(
+        rx.heading("Archivo del Capitolio", size="8"),
+        rx.spacer(),
+        rx.color_mode.button(position="top-right"),
+        align="center",
+        width="100%",
+        padding_y="3",
+    )
+
+
+def index() -> rx.Component:
+    return rx.container(
+        header_bar(),
+        rx.grid(
+            rx.vstack(sidebar_upload(), align="start", gap="4", width="100%"),
+            rx.vstack(search_bar(), docs_grid(), align="start", gap="4", width="100%"),
+            # CORRECCIÓN: 'columns' del layout principal debe ser un string.
+            columns="1 2", 
+            gap="5",
+            width="100%",
+        ),
+        padding_y="4",
+        min_height="90vh",
+    )
+
+
+# ---------------- App ----------------
 app = rx.App()
-app.add_page(page, route="/", title="Archivo del Capitolio")
+app.add_page(index, route="/", title="Sistema de Gestión Documental")
