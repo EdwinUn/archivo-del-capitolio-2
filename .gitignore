@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Entornos
+venv/
+.venv/
+env/
+.env
+*.env
+
+# Reflex / build
+.web/
+.states/
+uploaded_files/
+
+# Sistema / IDE
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
